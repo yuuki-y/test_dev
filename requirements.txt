@@ -1,2 +1,20 @@
+# Core deep learning framework
 torch
-torchvision
+
+# Hugging Face Accelerate for distributed training
+accelerate
+
+# DeepSpeed for memory optimization
+deepspeed
+
+# For reading/writing NIFTI files (.nii.gz)
+nibabel
+
+# For flexible tensor operations, useful for Transformers
+einops
+
+# For logging metrics
+tensorboard
+
+# A general-purpose ML toolkit
+scikit-learn

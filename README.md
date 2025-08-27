@@ -1,90 +1,94 @@
-# 2D-to-3D Image Generation via Late Fusion U-Net
+# 3D X-ray Deformation Transformer
 
-## Overview
+This project implements a Transformer-based model to predict 3D deformation fields from a series of 2D X-ray images. It takes four 2D images as input (2 frontal, 2 lateral) and outputs a 3D volume representing the deformation (dx, dy, dz).
 
-This project provides a PyTorch implementation of a deep learning model that generates a single 3D image volume from four separate 2D image inputs. The model is specifically designed to handle inputs of shape `(1, 256, 256)` and produce a 3D image of shape `(3, 256, 256, 256)`.
+The model is designed for distributed training using PyTorch and Hugging Face Accelerate, with support for DeepSpeed and Fully Sharded Data Parallelism (FSDP) for memory optimization on multi-GPU setups.
 
-The architecture is tailored for memory efficiency and performance on modern GPUs like the NVIDIA RTX 6000 Ada series.
+## Project Structure
 
-## Model Architecture
-
-The core of the project is a U-Net-like convolutional neural network with a novel structure for fusing information from multiple 2D sources to create a 3D output.
-
-1.  **Four 2D Encoders**: Each of the four 2D input images is processed by a separate, independent 2D encoder. These encoders are based on a standard U-Net downsampling path, consisting of repeated blocks of `Conv2d -> BatchNorm2d -> ReLU` followed by `MaxPool2d`. Skip connections are stored at each resolution level.
-2.  **Late Fusion**: The features from the bottleneck (the most compressed layer) of all four encoders are concatenated. This combined feature map is then processed by a fusion convolution layer. This "late fusion" approach allows the model to learn specialized features for each input before combining them.
-3.  **3D Decoder**: The fused feature map is expanded from 2D to 3D to form the starting point of the decoder. The decoder then progressively upsamples the volume using `ConvTranspose3d`.
-4.  **3D Skip Connections**: At each upsampling stage in the 3D decoder, the corresponding 2D skip connections from all four encoders are fused and expanded into a 3D volume. This 3D skip connection is then concatenated with the decoder's feature map, mimicking the U-Net design and helping to preserve fine-grained details.
-
-## File Structure
-
--   `models.py`: Contains the complete PyTorch implementation of the `LateFusionUNet`, including all its sub-modules (`Encoder2D`, `DecoderBlock3D`, etc.).
--   `loss.py`: Defines a custom `CombinedLoss` function, which is a weighted sum of L1 Loss and a 3D Structural Similarity Index (SSIM) loss. This is designed to improve perceptual quality in the generated images.
--   `train.py`: A comprehensive training script. It includes a dummy data generator for testing, command-line arguments for hyperparameter tuning, and a full training loop with support for modern GPU features.
--   `requirements.txt`: A list of necessary Python packages to run the project.
+- `model.py`: Contains the PyTorch implementation of the `XrayFusionTransformer` model.
+- `dataset.py`: Defines the custom `Dataset` for loading `.pt` images and `.nii.gz` labels.
+- `train.py`: The main training script using `Accelerate` for distributed training.
+- `utils.py`: Utility functions, such as saving predictions to `.nii.gz` format.
+- `requirements.txt`: A list of Python dependencies.
+- `config/`: Contains sample configuration files for `Accelerate` and `DeepSpeed`.
+  - `default_config.yaml`: Sample `Accelerate` config for a 2-node, 6-GPU FSDP setup.
+  - `ds_config.json`: Sample `DeepSpeed` config using ZeRO Stage 2.
+- `data/`: (You need to create this directory) Root directory for your datasets.
 
 ## Setup
 
-1.  **Clone the repository**:
-    ```bash
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
+### 1. Create Data Directories
 
-2.  **Create a virtual environment** (recommended):
-    ```bash
-    python -m venv venv
-    source venv/bin/activate
-    ```
+You need to organize your data as follows. The training script expects specific directory names.
 
-3.  **Install dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-## Usage
-
-The `train.py` script is the main entry point for training the model.
-
-### Running a Test Training
-
-You can start a test run using the default parameters (which are set for low-memory environments):
-```bash
-python train.py
+```
+/path/to/your/data/
+├── frontal_1/      # Contains first frontal images (*.pt)
+├── frontal_2/      # Contains second frontal images (*.pt)
+├── lateral_1/      # Contains first lateral images (*.pt)
+├── lateral_2/      # Contains second lateral images (*.pt)
+└── labels/         # Contains 3D label volumes (*.nii.gz)
 ```
 
-### Customizing Training
+**Note:** The filenames in each directory must correspond to each other. For example, `frontal_1/scan_001.pt` should correspond to `labels/scan_001.nii.gz`.
 
-The script provides several command-line arguments to control the training process:
+### 2. Install Dependencies
 
--   `--epochs`: Number of training epochs (default: 5).
--   `--batch-size`: Batch size (default: 1).
--   `--learning-rate`: Learning rate for the AdamW optimizer (default: 1e-4).
--   `--img-size`: The spatial dimension of the input images and output volume (default: 64). For full-scale training, set this to `256`.
--   `--features`: A list of integers defining the number of channels in the encoder blocks (e.g., `--features 16 32 64 128`).
--   `--use-checkpointing`: A flag to enable gradient checkpointing, which trades computation for a significant reduction in memory usage. Recommended for large image sizes.
--   `--no-amp`: A flag to disable Automatic Mixed Precision (AMP). AMP is enabled by default on CUDA devices.
--   `--device`: The device to train on (default: `cuda`).
+It is recommended to use a virtual environment (e.g., venv or conda).
 
-**Example for full-scale training on an RTX 6000 Ada:**
 ```bash
-python train.py \
-    --epochs 100 \
-    --batch-size 1 \
-    --img-size 256 \
-    --features 16 32 64 128 \
-    --learning-rate 0.0002 \
-    --use-checkpointing
+# Create and activate a virtual environment
+python -m venv venv
+source venv/bin/activate
+
+# Install all required packages
+pip install -r requirements.txt
 ```
 
-### Using Your Own Data
+### 3. Configure Distributed Environment
 
-The script uses a `Dummy3DDataset` by default. To train on your own data, you need to create your own `torch.utils.data.Dataset` class and replace it in `train.py`. Your dataset's `__getitem__` method should return a tuple containing:
-1.  A list of 4 tensors, each of shape `(1, H, W)`.
-2.  A single target tensor of shape `(3, D, H, W)`.
+This project uses `Hugging Face Accelerate` to manage distributed training.
 
-## Key Features
+**First, run the configuration wizard:**
+```bash
+accelerate config
+```
 
--   **Memory Efficient**: Includes gradient checkpointing (`torch.utils.checkpoint`) to reduce VRAM usage during training.
--   **High Performance**: Supports Automatic Mixed Precision (`torch.cuda.amp`) for faster training on NVIDIA GPUs with Tensor Cores.
--   **Flexible**: Model architecture and training parameters can be easily configured via command-line arguments.
--   **Advanced Loss Function**: Uses a combination of L1 and 3D SSIM loss to optimize for both pixel accuracy and perceptual quality.
+The wizard will ask you a series of questions about your setup (e.g., number of machines, number of GPUs, if you want to use DeepSpeed or FSDP). Answer them according to your hardware. A sample configuration for a 2-node, 6-GPU FSDP setup is provided in `config/default_config.yaml`. You will need to **edit the `main_process_ip`** in the generated file.
+
+If you choose to use DeepSpeed, you can use the `config/ds_config.json` as a starting point by passing it during the `accelerate config` process.
+
+## Training
+
+To start training, use the `accelerate launch` command. You need to provide the path to your data directory.
+
+```bash
+accelerate launch train.py \
+    --data_dir /path/to/your/data/ \
+    --output_dir /path/to/save/checkpoints_and_logs/ \
+    --epochs 50 \
+    --batch_size 1 \
+    --learning_rate 1e-4 \
+    --image_size 256 \
+    --patch_size 16
+```
+
+### Command Line Arguments for `train.py`
+
+- `--data_dir`: (Required) Path to the root data directory.
+- `--output_dir`: (Required) Directory to save model checkpoints and validation outputs.
+- `--epochs`: Number of training epochs.
+- `--batch_size`: Batch size per GPU.
+- `--learning_rate`: Peak learning rate for the optimizer.
+- `--image_size`: Size of the input images (e.g., 256).
+- `--patch_size`: Patch size for the Vision Transformer.
+- `--model_embed_dim`: Embedding dimension for the transformer model.
+- `--model_depth`: Number of layers in the main transformer encoder.
+- `--model_num_heads`: Number of attention heads in the transformer.
+- `--log_with`: Logger to use (e.g., 'tensorboard', 'wandb'). Defaults to 'tensorboard'.
+- `--save_every`: Save a checkpoint every N epochs.
+
+## Inference
+
+To run inference on new data, you can adapt the validation loop in `train.py`. You would load a trained checkpoint and process your data through the model's `eval()` mode. The script already saves validation outputs as `.nii.gz` files in the `output_dir`.
