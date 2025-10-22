@@ -2,100 +2,167 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SSIM3D(nn.Module):
+# DiffDRRのモジュールをインポート
+try:
+    from diffdrr.drr import DRR
+    from diffdrr.projectors.siddon import Siddon
+    DIFFDRR_AVAILABLE = True
+except ImportError:
+    print("警告: diffdrrライブラリが見つかりません。X線一貫性損失は計算されません。")
+    DIFFDRR_AVAILABLE = False
+
+class DX2CTLoss(nn.Module):
     """
-    3D Structural Similarity Index Measure (SSIM)
+    DX2CTモデルのための複合損失関数。
+    1. 2D拡散損失 (MSE of predicted noise)
+    2. X線一貫性損失 (L1 of DRR projections)
     """
-    def __init__(self, window_size=7, k1=0.01, k2=0.03, sigma=1.5):
-        super(SSIM3D, self).__init__()
-        self.window_size = window_size
-        self.k1 = k1
-        self.k2 = k2
-        self.sigma = sigma
+    def __init__(self, device='cuda:0', xray_loss_weight=1.0, volume_shape=[256, 256, 256], pixel_size=1.0):
+        super().__init__()
+        self.device = device
+        self.xray_loss_weight = xray_loss_weight
+        self.volume_shape = volume_shape
 
-        # Create a 1D Gaussian kernel
-        gauss = torch.arange(-(window_size // 2), window_size // 2 + 1, dtype=torch.float)
-        gauss = torch.exp(-gauss.pow(2.0) / (2 * sigma ** 2))
+        if not DIFFDRR_AVAILABLE:
+            print("DiffDRRが利用不可のため、X線一貫性損失は無効化されます。")
+            return
 
-        # Create 3D Gaussian window
-        _1D_window = (gauss / gauss.sum()).unsqueeze(1)
-        _2D_window = _1D_window.mm(_1D_window.t())
-        _3D_window = _1D_window.mm(_2D_window.reshape(1, -1)).reshape(window_size, window_size, window_size).float().unsqueeze(0).unsqueeze(0)
-        self.register_buffer('window', _3D_window)
+        # --- DiffDRRの射影ジオメトリを設定 ---
+        sdd = 1200.0  # Source-to-Detector Distance (mm)
+        detector_height = self.volume_shape[1]
+        detector_width = self.volume_shape[2]
 
-    def forward(self, img1, img2):
-        C = img1.size(1)
-        window = self.window.expand(C, 1, self.window_size, self.window_size, self.window_size).contiguous()
+        # DRRを生成するためのモジュールを初期化
+        # プロジェクタとしてSiddonを使用
+        self.drr_projector = Siddon(volume_shape=self.volume_shape,
+                                    voxel_spacing=[pixel_size, pixel_size, pixel_size],
+                                    device=self.device)
 
-        # --- Calculate mu ---
-        mu1 = F.conv3d(img1, window, padding=self.window_size // 2, groups=C)
-        mu2 = F.conv3d(img2, window, padding=self.window_size // 2, groups=C)
-        mu1_sq = mu1.pow(2)
-        mu2_sq = mu2.pow(2)
-        mu1_mu2 = mu1 * mu2
+        # AP (前方) と LAT (側面) の2つのビューを定義
+        # APビュー: Z軸から撮影
+        rotations_ap = torch.tensor([[0.0, 0.0, 0.0]], device=self.device)
+        translations_ap = torch.tensor([[0.0, 0.0, -sdd/2]], device=self.device)
 
-        # --- Calculate sigma ---
-        sigma1_sq = F.conv3d(img1 * img1, window, padding=self.window_size // 2, groups=C) - mu1_sq
-        sigma2_sq = F.conv3d(img2 * img2, window, padding=self.window_size // 2, groups=C) - mu2_sq
-        sigma12 = F.conv3d(img1 * img2, window, padding=self.window_size // 2, groups=C) - mu1_mu2
+        # LATビュー: Y軸周りに90度回転
+        rotations_lat = torch.tensor([[0.0, 90.0 * (3.14159 / 180.0), 0.0]], device=self.device)
+        translations_lat = torch.tensor([[0.0, 0.0, 0.0]], device=self.device)
 
-        # --- Calculate SSIM ---
-        # Get dynamic range of the images
-        L = img1.max() - img1.min() # Assumes images are scaled similarly
-        c1 = (self.k1 * L) ** 2
-        c2 = (self.k2 * L) ** 2
+        # DRRモジュールをAPとLATビュー用にそれぞれ作成
+        self.drr_ap = DRR(self.drr_projector, sdd, detector_height, detector_width, pixel_size,
+                          rotations=rotations_ap, translations=translations_ap)
+        self.drr_lat = DRR(self.drr_projector, sdd, detector_height, detector_width, pixel_size,
+                           rotations=rotations_lat, translations=translations_lat)
 
-        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
 
-        return ssim_map.mean()
+    def _predict_x0_from_noise(self, x_t, t, noise, alphas_cumprod):
+        """
+        DDPMの公式を用いて、予測されたノイズからクリーンな画像 x0 を推定する。
+        x_0 = (x_t - sqrt(1 - alpha_bar_t) * noise) / sqrt(alpha_bar_t)
+        """
+        # t に対応する alpha_cumprod を取得
+        sqrt_alpha_bar_t = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alphas_cumprod[t]).view(-1, 1, 1, 1)
 
-class CombinedLoss(nn.Module):
-    """
-    Combines L1 loss and 1-SSIM loss
-    """
-    def __init__(self, alpha=0.85):
-        super(CombinedLoss, self).__init__()
-        self.alpha = alpha
-        self.l1_loss = nn.L1Loss()
-        self.ssim_loss = SSIM3D()
-        print(f"CombinedLoss initialized with alpha = {self.alpha} (L1) and 1-alpha = {1-self.alpha} (SSIM)")
+        # デバイスを合わせる
+        sqrt_alpha_bar_t = sqrt_alpha_bar_t.to(x_t.device)
+        sqrt_one_minus_alpha_bar_t = sqrt_one_minus_alpha_bar_t.to(x_t.device)
 
-    def forward(self, y_pred, y_true):
-        l1 = self.l1_loss(y_pred, y_true)
-        ssim = self.ssim_loss(y_pred, y_true)
-        # SSIM is a similarity metric, so for loss we use 1 - ssim
-        ssim_loss = 1.0 - ssim
+        # x0 を予測
+        pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * noise) / sqrt_alpha_bar_t
+        return pred_x0
 
-        combined_loss = self.alpha * l1 + (1 - self.alpha) * ssim_loss
-        return combined_loss
+    def forward(self,
+                predicted_noise_slices,  # モデルが予測したノイズ (B*D, 1, H, W)
+                target_noise_slices,     # 実際のノイズ (B*D, 1, H, W)
+                noisy_ct_slices,         # ノイズが付与されたCTスライス (B*D, 1, H, W)
+                timesteps,               # 拡散ステップ (B*D)
+                ground_truth_xrays,      # 正解のX線画像 (B, 2, H, W)
+                diffusion_alphas_cumprod # 拡散スケジューラのalpha_cumprod
+               ):
 
+        # 1. 2D拡散損失の計算
+        diffusion_loss = F.mse_loss(predicted_noise_slices, target_noise_slices)
+
+        # 2. X線一貫性損失の計算
+        xray_consistency_loss = torch.tensor(0.0, device=self.device)
+
+        if self.xray_loss_weight > 0 and DIFFDRR_AVAILABLE:
+            batch_size = ground_truth_xrays.shape[0]
+            depth = 256
+
+            # 予測されたノイズから、予測されたクリーンなCTスライス(x0)を計算
+            pred_x0_slices = self._predict_x0_from_noise(
+                noisy_ct_slices, timesteps, predicted_noise_slices, diffusion_alphas_cumprod
+            )
+
+            # (B*D, 1, H, W) -> (B, D, H, W) に形状を戻す
+            pred_x0_volumes = pred_x0_slices.view(batch_size, depth,
+                                                  pred_x0_slices.shape[2],
+                                                  pred_x0_slices.shape[3])
+
+            # 生成された3DボリュームからDRRをレンダリング
+            # ボリュームの値をDRRに適した範囲にクリップ (例: 0以上)
+            pred_x0_volumes_clipped = pred_x0_volumes.clamp(min=0)
+
+            # 各ボリュームに対してDRRを生成し、損失を計算
+            for i in range(batch_size):
+                volume = pred_x0_volumes_clipped[i].unsqueeze(0) # (1, D, H, W)
+
+                # DRRを生成
+                drr_ap_pred = self.drr_ap(volume)
+                drr_lat_pred = self.drr_lat(volume)
+
+                # 正解X線画像と比較 (AP: 0番目, LAT: 1番目)
+                gt_ap = ground_truth_xrays[i, 0].unsqueeze(0)
+                gt_lat = ground_truth_xrays[i, 1].unsqueeze(0)
+
+                # L1損失を計算し、累積
+                xray_consistency_loss += F.l1_loss(drr_ap_pred, gt_ap)
+                xray_consistency_loss += F.l1_loss(drr_lat_pred, gt_lat)
+
+            # バッチサイズで平均化
+            xray_consistency_loss = xray_consistency_loss / batch_size
+
+        # 3. 2つの損失を結合
+        total_loss = diffusion_loss + self.xray_loss_weight * xray_consistency_loss
+
+        return total_loss, diffusion_loss, xray_consistency_loss
+
+
+# --- このファイル単体で実行した場合のテスト用コード ---
 if __name__ == '__main__':
-    # --- Verification ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    if not DIFFDRR_AVAILABLE:
+        print("DiffDRRがインストールされていないため、テストをスキップします。")
+    else:
+        print("DX2CTLossのテストを実行します。")
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-    # Create dummy 3D data
-    BATCH_SIZE = 1
-    CHANNELS = 3
-    DEPTH, HEIGHT, WIDTH = 32, 32, 32
+        loss_fn = DX2CTLoss(device=device, xray_loss_weight=0.5)
 
-    y_true = torch.rand(BATCH_SIZE, CHANNELS, DEPTH, HEIGHT, WIDTH).to(device)
-    y_pred_identical = y_true.clone().to(device)
-    y_pred_different = torch.rand(BATCH_SIZE, CHANNELS, DEPTH, HEIGHT, WIDTH).to(device)
+        # ダミー入力データを作成
+        B, D, H, W = 2, 256, 256, 256
 
-    # Initialize loss function
-    loss_fn = CombinedLoss(alpha=0.85).to(device)
+        predicted_noise = torch.randn(B * D, 1, H, W).to(device)
+        target_noise = torch.randn(B * D, 1, H, W).to(device)
+        noisy_slices = torch.randn(B * D, 1, H, W).to(device)
+        timesteps = torch.randint(0, 1000, (B * D,)).to(device)
+        xrays = torch.rand(B, 2, H, W).to(device) # [0, 1]の範囲
 
-    # --- Test Case 1: Identical images ---
-    # L1 should be 0, SSIM should be 1, Combined Loss should be 0
-    loss_identical = loss_fn(y_pred_identical, y_true)
-    print(f"\nLoss for identical images: {loss_identical.item():.6f}")
-    assert torch.isclose(loss_identical, torch.tensor(0.0), atol=1e-5), "Loss for identical images should be close to 0"
+        # ダミーの拡散スケジュールを作成
+        alphas_cumprod = torch.linspace(0.99, 0.01, 1000).to(device)
 
-    # --- Test Case 2: Different images ---
-    # Loss should be a positive value
-    loss_different = loss_fn(y_pred_different, y_true)
-    print(f"Loss for different images: {loss_different.item():.6f}")
-    assert loss_different.item() > 0, "Loss for different images should be positive"
+        # 損失を計算
+        total_loss, diff_loss, xray_loss = loss_fn(
+            predicted_noise, target_noise, noisy_slices, timesteps, xrays, alphas_cumprod
+        )
 
-    print("\nLoss function verification successful!")
+        print(f"Total Loss: {total_loss.item():.4f}")
+        print(f"  - Diffusion Loss: {diff_loss.item():.4f}")
+        print(f"  - X-ray Consistency Loss: {xray_loss.item():.4f}")
+
+        # バックワードパスをテスト
+        try:
+            total_loss.backward()
+            print("✅ バックワードパスのテストに成功しました。")
+        except Exception as e:
+            print(f"❌ バックワードパスのテストでエラーが発生しました: {e}")
