@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 # DiffDRRのモジュールをインポート
 try:
@@ -10,6 +11,27 @@ try:
 except ImportError:
     print("警告: diffdrrライブラリが見つかりません。X線一貫性損失は計算されません。")
     DIFFDRR_AVAILABLE = False
+
+def euler_to_quaternion(euler_deg, device):
+    """
+    Euler角 (roll, pitch, yaw) をクォータニオン (w, x, y, z) に変換する。
+    Args:
+        euler_deg (tuple of float): (roll, pitch, yaw) in degrees.
+        device: The torch device.
+    """
+    roll, pitch, yaw = [torch.deg2rad(torch.tensor(a, dtype=torch.float32)) for a in euler_deg]
+    cr, sr = torch.cos(roll / 2), torch.sin(roll / 2)
+    cp, sp = torch.cos(pitch / 2), torch.sin(pitch / 2)
+    cy, sy = torch.cos(yaw / 2), torch.sin(yaw / 2)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+
+    # Shape: (1, 4)
+    return torch.tensor([[w, x, y, z]], dtype=torch.float32, device=device)
+
 
 class DX2CTLoss(nn.Module):
     """
@@ -27,57 +49,58 @@ class DX2CTLoss(nn.Module):
             print("DiffDRRが利用不可のため、X線一貫性損失は無効化されます。")
             return
 
-        # --- DiffDRRの射影ジオメトリを設定 ---
-        sdd = 1200.0  # Source-to-Detector Distance (mm)
+        # --- 新しいDiffDRRの射影ジオメトリを設定 ---
+        sdd = 1000.0  # Source-to-Detector Distance (mm)
+        delx = 2.0    # Detector pixel size (mm)
+
         detector_height = self.volume_shape[1]
-        detector_width = self.volume_shape[2]
 
-        # DRRを生成するためのモジュールを初期化
-        # プロジェクタとしてSiddonを使用
-        self.drr_projector = Siddon(volume_shape=self.volume_shape,
-                                    voxel_spacing=[pixel_size, pixel_size, pixel_size],
-                                    device=self.device)
+        # DRRプロジェクタを初期化
+        self.drr_projector = Siddon(
+            volume_shape=self.volume_shape,
+            voxel_spacing=[pixel_size, pixel_size, pixel_size],
+            device=self.device
+        )
 
-        # AP (前方) と LAT (側面) の2つのビューを定義
-        # APビュー: Z軸から撮影
-        rotations_ap = torch.tensor([[0.0, 0.0, 0.0]], device=self.device)
-        translations_ap = torch.tensor([[0.0, 0.0, -sdd/2]], device=self.device)
+        # 単一のDRRモジュールを初期化
+        self.drr = DRR(
+            self.drr_projector, sdd=sdd, height=detector_height, delx=delx
+        ).to(self.device)
 
-        # LATビュー: Y軸周りに90度回転
-        rotations_lat = torch.tensor([[0.0, 90.0 * (3.14159 / 180.0), 0.0]], device=self.device)
-        translations_lat = torch.tensor([[0.0, 0.0, 0.0]], device=self.device)
+        # --- 回転と平行移動を定義し、バッファとして登録 ---
+        # 1. AP (前方) と LAT (側面) の回転角 [deg]
+        rotations_deg = {
+            "AP": (0, 0, 180),
+            "LAT": (0, 0, -90),
+        }
 
-        # DRRモジュールをAPとLATビュー用にそれぞれ作成
-        self.drr_ap = DRR(self.drr_projector, sdd, detector_height, detector_width, pixel_size,
-                          rotations=rotations_ap, translations=translations_ap)
-        self.drr_lat = DRR(self.drr_projector, sdd, detector_height, detector_width, pixel_size,
-                           rotations=rotations_lat, translations=translations_lat)
+        # 2. Euler角をクォータニオンに変換
+        quat_ap = euler_to_quaternion(rotations_deg["AP"], self.device)
+        quat_lat = euler_to_quaternion(rotations_deg["LAT"], self.device)
+        self.register_buffer('quat_ap', quat_ap)
+        self.register_buffer('quat_lat', quat_lat)
+
+        # 3. 平行移動ベクトル (mm)
+        translations = torch.tensor([[0.0, 500.0, 0.0]], device=self.device)
+        self.register_buffer('translations', translations)
 
 
     def _predict_x0_from_noise(self, x_t, t, noise, alphas_cumprod):
         """
         DDPMの公式を用いて、予測されたノイズからクリーンな画像 x0 を推定する。
-        x_0 = (x_t - sqrt(1 - alpha_bar_t) * noise) / sqrt(alpha_bar_t)
         """
-        # t に対応する alpha_cumprod を取得
-        sqrt_alpha_bar_t = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1)
-        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alphas_cumprod[t]).view(-1, 1, 1, 1)
-
-        # デバイスを合わせる
-        sqrt_alpha_bar_t = sqrt_alpha_bar_t.to(x_t.device)
-        sqrt_one_minus_alpha_bar_t = sqrt_one_minus_alpha_bar_t.to(x_t.device)
-
-        # x0 を予測
+        sqrt_alpha_bar_t = torch.sqrt(alphas_cumprod[t]).view(-1, 1, 1, 1).to(x_t.device)
+        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alphas_cumprod[t]).view(-1, 1, 1, 1).to(x_t.device)
         pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * noise) / sqrt_alpha_bar_t
         return pred_x0
 
     def forward(self,
-                predicted_noise_slices,  # モデルが予測したノイズ (B*D, 1, H, W)
-                target_noise_slices,     # 実際のノイズ (B*D, 1, H, W)
-                noisy_ct_slices,         # ノイズが付与されたCTスライス (B*D, 1, H, W)
-                timesteps,               # 拡散ステップ (B*D)
-                ground_truth_xrays,      # 正解のX線画像 (B, 2, H, W)
-                diffusion_alphas_cumprod # 拡散スケジューラのalpha_cumprod
+                predicted_noise_slices,
+                target_noise_slices,
+                noisy_ct_slices,
+                timesteps,
+                ground_truth_xrays,
+                diffusion_alphas_cumprod
                ):
 
         # 1. 2D拡散損失の計算
@@ -88,39 +111,30 @@ class DX2CTLoss(nn.Module):
 
         if self.xray_loss_weight > 0 and DIFFDRR_AVAILABLE:
             batch_size = ground_truth_xrays.shape[0]
-            depth = 256
 
-            # 予測されたノイズから、予測されたクリーンなCTスライス(x0)を計算
             pred_x0_slices = self._predict_x0_from_noise(
                 noisy_ct_slices, timesteps, predicted_noise_slices, diffusion_alphas_cumprod
             )
 
-            # (B*D, 1, H, W) -> (B, D, H, W) に形状を戻す
-            pred_x0_volumes = pred_x0_slices.view(batch_size, depth,
-                                                  pred_x0_slices.shape[2],
-                                                  pred_x0_slices.shape[3])
+            pred_x0_volumes = pred_x0_slices.view(
+                batch_size, self.volume_shape[0], self.volume_shape[1], self.volume_shape[2]
+            )
 
-            # 生成された3DボリュームからDRRをレンダリング
-            # ボリュームの値をDRRに適した範囲にクリップ (例: 0以上)
             pred_x0_volumes_clipped = pred_x0_volumes.clamp(min=0)
 
-            # 各ボリュームに対してDRRを生成し、損失を計算
             for i in range(batch_size):
-                volume = pred_x0_volumes_clipped[i].unsqueeze(0) # (1, D, H, W)
+                volume = pred_x0_volumes_clipped[i].unsqueeze(0)
 
-                # DRRを生成
-                drr_ap_pred = self.drr_ap(volume)
-                drr_lat_pred = self.drr_lat(volume)
+                # クォータニオンを使ってDRRを生成
+                drr_ap_pred = self.drr(volume, self.quat_ap, self.translations, parameterization="quaternion")
+                drr_lat_pred = self.drr(volume, self.quat_lat, self.translations, parameterization="quaternion")
 
-                # 正解X線画像と比較 (AP: 0番目, LAT: 1番目)
                 gt_ap = ground_truth_xrays[i, 0].unsqueeze(0)
                 gt_lat = ground_truth_xrays[i, 1].unsqueeze(0)
 
-                # L1損失を計算し、累積
                 xray_consistency_loss += F.l1_loss(drr_ap_pred, gt_ap)
                 xray_consistency_loss += F.l1_loss(drr_lat_pred, gt_lat)
 
-            # バッチサイズで平均化
             xray_consistency_loss = xray_consistency_loss / batch_size
 
         # 3. 2つの損失を結合
@@ -137,21 +151,23 @@ if __name__ == '__main__':
         print("DX2CTLossのテストを実行します。")
         device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
-        loss_fn = DX2CTLoss(device=device, xray_loss_weight=0.5)
+        # 小さなボリュームでテスト
+        D, H, W = 64, 64, 128 # Detector width != height
+        loss_fn = DX2CTLoss(
+            device=device, xray_loss_weight=0.5, volume_shape=[D, H, W], pixel_size=1.5
+        )
 
         # ダミー入力データを作成
-        B, D, H, W = 2, 256, 256, 256
-
+        B = 2
         predicted_noise = torch.randn(B * D, 1, H, W).to(device)
         target_noise = torch.randn(B * D, 1, H, W).to(device)
         noisy_slices = torch.randn(B * D, 1, H, W).to(device)
         timesteps = torch.randint(0, 1000, (B * D,)).to(device)
-        xrays = torch.rand(B, 2, H, W).to(device) # [0, 1]の範囲
+        # DRRの出力サイズは (B, H, W) になる
+        xrays = torch.rand(B, 2, H, W).to(device)
 
-        # ダミーの拡散スケジュールを作成
         alphas_cumprod = torch.linspace(0.99, 0.01, 1000).to(device)
 
-        # 損失を計算
         total_loss, diff_loss, xray_loss = loss_fn(
             predicted_noise, target_noise, noisy_slices, timesteps, xrays, alphas_cumprod
         )
@@ -160,7 +176,6 @@ if __name__ == '__main__':
         print(f"  - Diffusion Loss: {diff_loss.item():.4f}")
         print(f"  - X-ray Consistency Loss: {xray_loss.item():.4f}")
 
-        # バックワードパスをテスト
         try:
             total_loss.backward()
             print("✅ バックワードパスのテストに成功しました。")
